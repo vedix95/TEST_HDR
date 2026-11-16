@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=TEST_HDR
+GenericName=Testeur HDR & Triangle CIE 1931
+Comment=Testeur HDR/WCG, mires 10-bit, triangle CIE 1931 et générateur ICC pour Hyprland/Omarchy
+Exec=testhdr
+Icon=testhdr
+Terminal=false
+Categories=Graphics;Utility;System;
+Keywords=HDR;ICC;CIE;Monitor;Hyprland;Monique;Gamut;
+StartupNotify=true

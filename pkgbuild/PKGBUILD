@@ -1,0 +1,39 @@
+# Maintainer: vedix95 <vedix95@gmail.com>
+pkgname=testhdr
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="Testeur HDR/WCG natif Wayland/Hyprland (mères en nits, triangle CIE 1931, mires 10-bit & générateur ICC)"
+arch=('x86_64')
+url="https://github.com/vedix95/TEST_HDR"
+license=('MIT')
+depends=('sdl3' 'pango' 'cairo' 'wayland' 'lcms2' 'python' 'brightnessctl')
+makedepends=('cmake' 'gcc' 'pkgconf' 'shaderc' 'wayland-protocols' 'python')
+optdepends=(
+  'monique: gestionnaire graphique des profils Hyprland/ICC'
+  'xdg-terminal-exec: installation assistee de monique sous Omarchy'
+)
+
+_srcroot="${TESTHDR_SRCROOT:-}"
+
+build() {
+  local src="${_srcroot}"
+  if [[ -z "$src" ]]; then
+    src="$(cd "$startdir/.." && pwd)"
+  fi
+  cmake -S "$src" -B "$srcdir/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+  cmake --build "$srcdir/build" -j"$(nproc)"
+}
+
+check() {
+  ctest --test-dir "$srcdir/build" --output-on-failure
+}
+
+package() {
+  local src="${_srcroot}"
+  if [[ -z "$src" ]]; then
+    src="$(cd "$startdir/.." && pwd)"
+  fi
+  DESTDIR="$pkgdir" cmake --install "$srcdir/build"
+  install -Dm644 "$src/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$src/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

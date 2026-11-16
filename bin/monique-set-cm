@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Apply Hyprland color management / HDR / ICC settings and sync profiles via Monique.
+
+Modes:
+  1) Single preset apply:
+       monique-set-cm <hdr|hdredid|dcip3|srgb10|srgb|auto|icc> [--icc <path>] [--monitor ...]
+  2) Replace all Monique profiles with detected modes & calibrated ICC profiles:
+       monique-set-cm --sync-profiles [--monitor ...] [--hdr-capable] [--supports-p3]
+                      [--min-nits ...] [--avg-nits ...] [--max-nits ...] [--active-cm ...]
+                      [--icc-native ...] [--icc-p3 ...] [--icc-srgb ...]
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import sys
+import time
+
+
+def _light_tier(peak_nits: float, _hdr_active: bool = True) -> str:
+    if peak_nits < 250.0:
+        return "LOW"
+    if peak_nits < 450.0:
+        return "MEDIUM"
+    if peak_nits < 850.0:
+        return "HIGH"
+    return "ULTRA HIGH"
+
+
+def _color_tier(bpc: int, gamut: str, hdr_active: bool) -> str:
+    if bpc < 10:
+        return "LOW" if gamut == "sRGB" else "MEDIUM"
+    if gamut == "BT.2020" and hdr_active:
+        return "ULTRA HIGH"
+    if gamut in ("DCI-P3", "BT.2020"):
+        return "HIGH"
+    return "MEDIUM"
+
+
+def _format_profile_name(
+    bpc: int, is_hdr: bool, color_tier: str, light_tier: str, base_name: str
+) -> str:
+    mode_tag = "HDR" if is_hdr else "SDR"
+    return f"[{bpc} BIT {mode_tag} • Couleur: {color_tier} • Lumière: {light_tier}] {base_name}"
+
+
+def _clone_monitor_with_cm(
+    base_monitors: list,
+    target_name: str,
+    cm: str,
+    *,
+    min_nits: float,
+    avg_nits: float,
+    max_nits: float,
+    sdr_max_nits: float = 80.0,
+    sdr_brightness: float = 1.0,
+    sdr_saturation: float = 1.0,
+    icc_path: str = "",
+    bitdepth_override: int = 0,
+) -> list:
+    cloned = copy.deepcopy(base_monitors)
+    for m in cloned:
+        if m.name != target_name:
+            continue
+        if icc_path:
+            m.bitdepth = bitdepth_override or 10
+            m.color_management = cm
+            m.icc_profile = icc_path
+            is_hdr_icc = cm in ("hdr", "hdredid")
+            m.supports_hdr = 1 if is_hdr_icc else 0
+            m.supports_wide_color = 1 if (m.bitdepth >= 10 or is_hdr_icc) else 0
+            m.sdr_min_luminance = 0.2
+            m.sdr_max_luminance = 80
+            m.sdr_brightness = 1.0
+            m.sdr_saturation = 1.0
+            if is_hdr_icc:
+                m.min_luminance = round(min_nits, 4) if min_nits >= 0.0 else 0.0
+                m.max_luminance = int(round(max_nits)) if max_nits > 0.0 else 0
+                m.max_avg_luminance = int(round(avg_nits)) if avg_nits > 0.0 else 0
+            else:
+                m.min_luminance = 0.0
+                m.max_luminance = 0
+                m.max_avg_luminance = 0
+        elif cm in ("hdr", "hdredid"):
+            m.bitdepth = 10
+            m.color_management = cm
+            m.icc_profile = ""
+            m.supports_hdr = 1
+            m.supports_wide_color = 1
+            m.sdr_min_luminance = 0.2
+            m.sdr_max_luminance = int(round(sdr_max_nits))
+            m.sdr_brightness = sdr_brightness
+            m.sdr_saturation = sdr_saturation
+            if cm == "hdr":
+                m.min_luminance = round(min_nits, 4) if min_nits >= 0.0 else 0.0
+                m.max_luminance = int(round(max_nits)) if max_nits > 0.0 else 0
+                m.max_avg_luminance = int(round(avg_nits)) if avg_nits > 0.0 else 0
+            else:
+                m.min_luminance = 0.0
+                m.max_luminance = 0
+                m.max_avg_luminance = 0
+        elif cm == "dcip3":
+            m.bitdepth = 10
+            m.color_management = "dcip3"
+            m.icc_profile = ""
+            m.supports_hdr = 0
+            m.supports_wide_color = 1
+            m.sdr_min_luminance = 0.2
+            m.sdr_max_luminance = 80
+            m.sdr_brightness = 1.0
+            m.sdr_saturation = 1.0
+            m.min_luminance = 0.0
+            m.max_luminance = 0
+            m.max_avg_luminance = 0
+        elif cm == "auto":
+            m.bitdepth = 10
+            m.color_management = "auto"
+            m.icc_profile = ""
+            m.supports_hdr = 0
+            m.supports_wide_color = 1
+        elif cm == "srgb10":
+            m.bitdepth = 10
+            m.color_management = "srgb"
+            m.icc_profile = ""
+            m.supports_hdr = 0
+            m.supports_wide_color = 0
+            m.sdr_min_luminance = 0.2
+            m.sdr_max_luminance = 80
+            m.sdr_brightness = 1.0
+            m.sdr_saturation = 1.0
+            m.min_luminance = 0.0
+            m.max_luminance = 0
+            m.max_avg_luminance = 0
+        else:  # srgb
+            m.bitdepth = 8
+            m.color_management = "srgb"
+            m.icc_profile = ""
+            m.supports_hdr = 0
+            m.supports_wide_color = 0
+            m.sdr_min_luminance = 0.2
+            m.sdr_max_luminance = 80
+            m.sdr_brightness = 1.0
+            m.sdr_saturation = 1.0
+            m.min_luminance = 0.0
+            m.max_luminance = 0
+            m.max_avg_luminance = 0
+    return cloned
+
+
+def _apply_cm_to_monitor(m, args) -> None:
+    if args.cm == "icc" or args.icc:
+        m.bitdepth = 10
+        m.color_management = "dcip3"
+        m.icc_profile = args.icc or m.icc_profile
+        m.supports_hdr = 0
+        m.supports_wide_color = 1
+        return
+
+    m.icc_profile = ""
+    if args.cm in ("hdr", "hdredid"):
+        m.bitdepth = 10
+        m.color_management = args.cm
+        m.supports_hdr = 1
+        m.supports_wide_color = 1
+        if m.sdr_min_luminance <= 0.0:
+            m.sdr_min_luminance = 0.2
+        if m.sdr_max_luminance <= 0.0:
+            m.sdr_max_luminance = 80
+        else:
+            m.sdr_max_luminance = int(round(m.sdr_max_luminance))
+        if args.cm == "hdr":
+            if args.min_nits >= 0.0:
+                m.min_luminance = round(args.min_nits, 4)
+            if args.max_nits > 0.0:
+                m.max_luminance = int(round(args.max_nits))
+            if args.avg_nits > 0.0:
+                m.max_avg_luminance = int(round(args.avg_nits))
+        else:
+            m.min_luminance = 0.0
+            m.max_luminance = 0
+            m.max_avg_luminance = 0
+    elif args.cm == "dcip3":
+        m.bitdepth = 10
+        m.color_management = "dcip3"
+        m.supports_hdr = 0
+        m.supports_wide_color = 1
+    elif args.cm == "auto":
+        m.bitdepth = 10
+        m.color_management = "auto"
+        m.supports_hdr = 0
+        m.supports_wide_color = 1
+    elif args.cm == "srgb10":
+        m.bitdepth = 10
+        m.color_management = "srgb"
+        m.supports_hdr = 0
+        m.supports_wide_color = 0
+    else:  # srgb
+        m.bitdepth = 8
+        m.color_management = "srgb"
+        m.supports_hdr = 0
+        m.supports_wide_color = 0
+
+
+def _sync_profiles(ipc, pm, settings, live_monitors, target_name: str, args) -> int:
+    from monique.models import Profile
+    from monique.utils import save_active_profile, save_pinned_profile
+
+    use_description = not settings.get("use_port_names", True)
+    hypr_fmt = settings.get("hypr_config_format")
+
+    # Remove all existing Monique profiles ("Remplace tout")
+    for old_name in pm.list_profiles():
+        pm.delete(old_name)
+
+    peak_hdr = args.max_nits if args.max_nits > 0.0 else 400.0
+    sdr_full = args.avg_nits if args.avg_nits > 80.0 else (args.max_nits if args.max_nits > 80.0 else 250.0)
+    hdr_light = _light_tier(peak_hdr, True)
+    sdr_light = _light_tier(sdr_full, False)
+
+    # (base_name, cm, sdr_max, sdr_b, sdr_s, icc_path, bpc, gamut, hdr_active)
+    specs: list[tuple[str, str, float, float, float, str, int, str, bool]] = []
+    if args.hdr_capable:
+        specs.append(("HDR Reference (EDID)", "hdr", 80.0, 1.0, 1.0, "", 10, "BT.2020", True))
+        specs.append(("HDR EDID Natif", "hdredid", 80.0, 1.0, 1.0, "", 10, "BT.2020", True))
+        specs.append(("HDR Lumineux (Bureau)", "hdr", 200.0, 1.4, 1.05, "", 10, "BT.2020", True))
+    if args.icc_bt2020_pq:
+        specs.append(("ICC BT.2020 PQ", "hdr", 80.0, 1.0, 1.0, args.icc_bt2020_pq, 10, "BT.2020", True))
+    if args.icc_bt2020_linear:
+        specs.append(("ICC BT.2020 Linéaire", "hdr", 80.0, 1.0, 1.0, args.icc_bt2020_linear, 10, "BT.2020", True))
+    if args.icc_native:
+        specs.append(("ICC EDID Natif", "dcip3", 80.0, 1.0, 1.0, args.icc_native, 10, "DCI-P3", False))
+    if args.icc_p3 and (args.supports_p3 or args.hdr_capable):
+        specs.append(("ICC DCI-P3 D65", "dcip3", 80.0, 1.0, 1.0, args.icc_p3, 10, "DCI-P3", False))
+    if args.supports_p3 or args.hdr_capable:
+        specs.append(("DCI-P3 Wide", "dcip3", 80.0, 1.0, 1.0, "", 10, "DCI-P3", False))
+    specs.append(("sRGB 10-bit", "srgb10", 80.0, 1.0, 1.0, "", 10, "sRGB", False))
+    if args.icc_srgb:
+        specs.append(("ICC sRGB Calibré", "srgb", 80.0, 1.0, 1.0, args.icc_srgb, 8, "sRGB", False))
+    specs.append(("sRGB Standard", "srgb", 80.0, 1.0, 1.0, "", 8, "sRGB", False))
+
+    created: list[Profile] = []
+    for base_name, cm, sdr_max, sdr_b, sdr_s, icc_path, bpc, gamut, is_hdr in specs:
+        c_tier = _color_tier(bpc, gamut, is_hdr)
+        l_tier = hdr_light if is_hdr else sdr_light
+        prof_name = _format_profile_name(bpc, is_hdr, c_tier, l_tier, base_name)
+        mons = _clone_monitor_with_cm(
+            live_monitors,
+            target_name,
+            cm,
+            min_nits=args.min_nits,
+            avg_nits=args.avg_nits,
+            max_nits=args.max_nits,
+            sdr_max_nits=sdr_max,
+            sdr_brightness=sdr_b,
+            sdr_saturation=sdr_s,
+            icc_path=icc_path,
+            bitdepth_override=bpc,
+        )
+        prof = Profile(name=prof_name, monitors=mons)
+        pm.save(prof)
+        created.append(prof)
+
+    desired_cm = args.active_cm or ("hdr" if args.hdr_capable else "srgb")
+    if desired_cm == "wide":
+        desired_cm = "dcip3"
+
+    active_prof = created[0]
+    if args.active_icc:
+        for prof in created:
+            if any(m.name == target_name and m.icc_profile == args.active_icc for m in prof.monitors):
+                active_prof = prof
+                break
+    else:
+        for prof in created:
+            if desired_cm == "srgb10":
+                if any(m.name == target_name and not m.icc_profile and m.color_management == "srgb" and m.bitdepth >= 10 for m in prof.monitors):
+                    active_prof = prof
+                    break
+            elif desired_cm == "srgb":
+                if any(m.name == target_name and not m.icc_profile and m.color_management == "srgb" and m.bitdepth < 10 for m in prof.monitors):
+                    active_prof = prof
+                    break
+            elif any(m.name == target_name and not m.icc_profile and m.color_management == desired_cm for m in prof.monitors):
+                active_prof = prof
+                break
+
+    active_prof.last_applied_time = time.time()
+    pm.save(active_prof)
+    save_active_profile(active_prof.name)
+    save_pinned_profile(active_prof.name, active_prof.fingerprint)
+
+    ipc.apply_profile(
+        active_prof,
+        update_sddm=False,
+        update_greetd=False,
+        use_description=use_description,
+        hypr_config_format=hypr_fmt,
+    )
+    print(f"{len(created)} profils créés ({active_prof.name})")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Apply monitor HDR/CM/ICC preset or sync profiles via Monique")
+    parser.add_argument("cm", nargs="?", choices=["hdr", "hdredid", "dcip3", "srgb10", "srgb", "auto", "icc"], default="hdr")
+    parser.add_argument("--sync-profiles", action="store_true", help="Replace all Monique profiles with detected modes")
+    parser.add_argument("--hdr-capable", action="store_true")
+    parser.add_argument("--supports-p3", action="store_true")
+    parser.add_argument("--active-cm", default="")
+    parser.add_argument("--active-icc", default="")
+    parser.add_argument("--icc", default="", help="ICC profile path for single apply")
+    parser.add_argument("--icc-native", default="")
+    parser.add_argument("--icc-p3", default="")
+    parser.add_argument("--icc-srgb", default="")
+    parser.add_argument("--icc-bt2020-linear", default="")
+    parser.add_argument("--icc-bt2020-pq", default="")
+    parser.add_argument("--monitor", default="", help="Target connector name (default: first enabled)")
+    parser.add_argument("--min-nits", type=float, default=-1.0)
+    parser.add_argument("--avg-nits", type=float, default=-1.0)
+    parser.add_argument("--max-nits", type=float, default=-1.0)
+    args = parser.parse_args()
+
+    try:
+        from monique.hyprland import HyprlandIPC
+        from monique.models import Profile
+        from monique.profile_manager import ProfileManager
+        from monique.utils import load_app_settings
+    except ImportError as exc:
+        print(f"monique module unavailable: {exc}", file=sys.stderr)
+        return 2
+
+    ipc = HyprlandIPC()
+    live_monitors = ipc.get_monitors()
+    if not live_monitors:
+        print("No Hyprland monitors detected", file=sys.stderr)
+        return 1
+
+    settings = load_app_settings()
+    pm = ProfileManager()
+
+    target_name = args.monitor
+    if not target_name:
+        for lm in live_monitors:
+            if lm.enabled:
+                target_name = lm.name
+                break
+        if not target_name:
+            target_name = live_monitors[0].name
+
+    if args.sync_profiles:
+        return _sync_profiles(ipc, pm, settings, live_monitors, target_name, args)
+
+    from monique.utils import save_active_profile, save_pinned_profile
+
+    use_description = not settings.get("use_port_names", True)
+    hypr_fmt = settings.get("hypr_config_format")
+    active_name = settings.get("active_profile") or ""
+
+    # If a dedicated Monique profile already matches the requested mode/ICC, select it
+    # instead of mutating an unrelated profile (like overwriting HDR Reference with sRGB).
+    matched_profile = None
+    for cand in pm.list_all():
+        for m in cand.monitors:
+            if m.name != target_name:
+                continue
+            if args.cm == "icc" or args.icc:
+                if args.icc and m.icc_profile == args.icc:
+                    matched_profile = cand
+                    break
+            elif not m.icc_profile:
+                if args.cm == "srgb10":
+                    if m.color_management == "srgb" and m.bitdepth >= 10:
+                        matched_profile = cand
+                        break
+                elif args.cm == "srgb":
+                    if m.color_management == "srgb" and m.bitdepth < 10:
+                        matched_profile = cand
+                        break
+                elif m.color_management == args.cm:
+                    matched_profile = cand
+                    break
+        if matched_profile is not None:
+            break
+
+    if matched_profile is not None:
+        matched_profile.last_applied_time = time.time()
+        pm.save(matched_profile)
+        save_active_profile(matched_profile.name)
+        save_pinned_profile(matched_profile.name, matched_profile.fingerprint)
+        ipc.apply_profile(
+            matched_profile,
+            update_sddm=False,
+            update_greetd=False,
+            use_description=use_description,
+            hypr_config_format=hypr_fmt,
+        )
+        return 0
+
+    profile = pm.load(active_name) if active_name else None
+    if profile is None or not profile.monitors:
+        profile = Profile(name=active_name or "testhdr", monitors=live_monitors)
+
+    live_by_name = {m.name: m for m in live_monitors}
+    target_found = False
+    for m in profile.monitors:
+        if m.name == target_name:
+            target_found = True
+            lm = live_by_name.get(m.name)
+            if lm is not None:
+                m.width = lm.width
+                m.height = lm.height
+                m.refresh_rate = lm.refresh_rate
+                m.x = lm.x
+                m.y = lm.y
+                m.scale = lm.scale
+                m.transform = lm.transform
+            _apply_cm_to_monitor(m, args)
+            break
+
+    if not target_found:
+        for lm in live_monitors:
+            if lm.name == target_name:
+                _apply_cm_to_monitor(lm, args)
+                profile.monitors.append(lm)
+                target_found = True
+                break
+
+    if not target_found:
+        print(f"Monitor '{target_name}' not found", file=sys.stderr)
+        return 1
+
+    if active_name:
+        pm.save(profile)
+
+    ipc.apply_profile(
+        profile,
+        update_sddm=False,
+        update_greetd=False,
+        use_description=use_description,
+        hypr_config_format=hypr_fmt,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git cmake gcc pkgconf sdl3 pango cairo wayland wayland-protocols lcms2 shaderc python
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and run unit tests
+        run: |
+          ./bin/build
+          ./build/testhdr --version

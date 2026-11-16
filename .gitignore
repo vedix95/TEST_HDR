@@ -1,0 +1,9 @@
+build/
+bin/__pycache__/
+*.pyc
+*.pyo
+pkgbuild/src/
+pkgbuild/pkg/
+pkgbuild/*.pkg.tar.*
+pkgbuild/testhdr-*
+.DS_Store

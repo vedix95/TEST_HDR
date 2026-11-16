@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+is_omarchy() {
+  grep -qiE '^(ID|NAME)=["'\'']?omarchy["'\'']?$' /etc/os-release 2>/dev/null || \
+    [[ -x /usr/share/omarchy/bin/omarchy-pkg-aur-add ]]
+}
+
+if ! command -v monique >/dev/null 2>&1 || ! python3 -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('monique') else 1)" 2>/dev/null; then
+  if is_omarchy; then
+    echo "[TEST_HDR] Monique n'est pas installé sur Omarchy."
+    read -r -p "Voulez-vous installer monique maintenant avant de continuer ? [O/n] " ans </dev/tty || ans="o"
+    if [[ -z "$ans" || "$ans" =~ ^[OoYy] ]]; then
+      if [[ -x /usr/share/omarchy/bin/omarchy-pkg-aur-add ]]; then
+        /usr/share/omarchy/bin/omarchy-pkg-aur-add monique
+      elif command -v yay >/dev/null 2>&1; then
+        yay -S --needed monique
+      elif command -v paru >/dev/null 2>&1; then
+        paru -S --needed monique
+      else
+        echo "[TEST_HDR] Installez monique manuellement (AUR: monique)." >&2
+      fi
+    fi
+  else
+    echo "[TEST_HDR] Monique absent (système non-Omarchy : installation auto non proposée)."
+  fi
+fi
+
+"$ROOT/bin/build"
+
+echo "[TEST_HDR] Construction et installation du paquet Arch/Omarchy..."
+(
+  cd "$ROOT/pkgbuild"
+  rm -rf src pkg ./*.pkg.tar.*
+  TESTHDR_SRCROOT="$ROOT" makepkg -fsi --noconfirm
+)
+echo "[TEST_HDR] Installé ! Lancez 'testhdr' ou cherchez TEST_HDR dans le lanceur Omarchy."
