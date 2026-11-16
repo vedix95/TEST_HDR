@@ -226,9 +226,17 @@ def _sync_profiles(ipc, pm, settings, live_monitors, target_name: str, args) -> 
     # (base_name, cm, sdr_max, sdr_b, sdr_s, icc_path, bpc, gamut, hdr_active)
     specs: list[tuple[str, str, float, float, float, str, int, str, bool]] = []
     if args.hdr_capable:
+        boost_soft = max(160.0, min(250.0, round(peak_hdr)))
+        boost_vivid = max(200.0, min(350.0, round(peak_hdr)))
+        boost_strong = max(220.0, min(400.0, round(peak_hdr)))
+        boost_max = max(250.0, round(peak_hdr))
         specs.append(("HDR Reference (EDID)", "hdr", 80.0, 1.0, 1.0, "", 10, "BT.2020", True))
         specs.append(("HDR EDID Natif", "hdredid", 80.0, 1.0, 1.0, "", 10, "BT.2020", True))
         specs.append(("HDR Lumineux (Bureau)", "hdr", 200.0, 1.4, 1.05, "", 10, "BT.2020", True))
+        specs.append((f"HDR Boost Doux ({int(boost_soft)} nits SDR)", "hdr", boost_soft, 1.25, 1.05, "", 10, "BT.2020", True))
+        specs.append((f"HDR Boost Cinéma Vif ({int(boost_vivid)} nits SDR)", "hdr", boost_vivid, 1.45, 1.15, "", 10, "BT.2020", True))
+        specs.append((f"HDR Boost Fort ({int(boost_strong)} nits SDR)", "hdr", boost_strong, 1.55, 1.10, "", 10, "BT.2020", True))
+        specs.append((f"HDR Boost Max ({int(boost_max)} nits Pic EDID)", "hdr", boost_max, 1.75, 1.12, "", 10, "BT.2020", True))
     if args.icc_bt2020_pq:
         specs.append(("ICC BT.2020 PQ", "hdr", 80.0, 1.0, 1.0, args.icc_bt2020_pq, 10, "BT.2020", True))
     if args.icc_bt2020_linear:
@@ -364,7 +372,10 @@ def main() -> int:
         has_target = False
         has_matching_icc = not args.icc_native
         has_foreign_monitor = False
+        has_hdr_boost = not args.hdr_capable
         for cand in existing:
+            if args.hdr_capable and "HDR Boost" in cand.name:
+                has_hdr_boost = True
             for m in cand.monitors:
                 if not m.enabled:
                     continue
@@ -378,7 +389,7 @@ def main() -> int:
                     has_foreign_monitor = True
                 if args.icc_native and m.name == target_name and m.icc_profile == args.icc_native:
                     has_matching_icc = True
-        if not existing or has_foreign_monitor or not has_target or not has_matching_icc:
+        if not existing or has_foreign_monitor or not has_target or not has_matching_icc or not has_hdr_boost:
             return _sync_profiles(ipc, pm, settings, live_monitors, target_name, args)
         print(f"Profils Monique déjà à jour ({len(existing)} profils)")
         return 0
@@ -425,8 +436,13 @@ def main() -> int:
                 m.enabled = lm.enabled
 
     # If a dedicated Monique profile already matches the requested mode/ICC AND live monitor(s), select it.
+    # For cm="hdr", prefer the standard Reference (80 nits SDR) profile over boosted desktop presets.
+    candidates = sorted(
+        pm.list_all(),
+        key=lambda c: (0 if "Reference" in c.name else 1, c.name),
+    )
     matched_profile = None
-    for cand in pm.list_all():
+    for cand in candidates:
         if not _profile_matches_live(cand):
             continue
         for m in cand.monitors:
