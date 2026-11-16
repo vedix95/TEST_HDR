@@ -150,10 +150,12 @@ def _clone_monitor_with_cm(
 
 def _apply_cm_to_monitor(m, args) -> None:
     if args.cm == "icc" or args.icc:
+        icc_path = args.icc or m.icc_profile
+        is_hdr_icc = "BT2020" in icc_path
         m.bitdepth = 10
-        m.color_management = "dcip3"
-        m.icc_profile = args.icc or m.icc_profile
-        m.supports_hdr = 0
+        m.color_management = "hdr" if is_hdr_icc else "dcip3"
+        m.icc_profile = icc_path
+        m.supports_hdr = 1 if is_hdr_icc else 0
         m.supports_wide_color = 1
         return
 
@@ -203,11 +205,14 @@ def _apply_cm_to_monitor(m, args) -> None:
 
 
 def _sync_profiles(ipc, pm, settings, live_monitors, target_name: str, args) -> int:
+    from pathlib import Path
     from monique.models import Profile
-    from monique.utils import save_active_profile, save_pinned_profile
+    from monique.utils import hyprland_config_dir, save_active_profile, save_pinned_profile
 
-    use_description = not settings.get("use_port_names", True)
+    use_description = not settings.get("use_port_names", False)
     hypr_fmt = settings.get("hypr_config_format")
+    if hypr_fmt == "legacy" and (hyprland_config_dir() / "hyprland.lua").exists():
+        hypr_fmt = "both"
 
     # Remove all existing Monique profiles ("Remplace tout")
     for old_name in pm.list_profiles():
@@ -305,6 +310,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Apply monitor HDR/CM/ICC preset or sync profiles via Monique")
     parser.add_argument("cm", nargs="?", choices=["hdr", "hdredid", "dcip3", "srgb10", "srgb", "auto", "icc"], default="hdr")
     parser.add_argument("--sync-profiles", action="store_true", help="Replace all Monique profiles with detected modes")
+    parser.add_argument("--sync-if-needed", action="store_true", help="Sync Monique profiles only if missing or belonging to another monitor")
     parser.add_argument("--hdr-capable", action="store_true")
     parser.add_argument("--supports-p3", action="store_true")
     parser.add_argument("--active-cm", default="")
@@ -351,18 +357,82 @@ def main() -> int:
     if args.sync_profiles:
         return _sync_profiles(ipc, pm, settings, live_monitors, target_name, args)
 
-    from monique.utils import save_active_profile, save_pinned_profile
+    if args.sync_if_needed:
+        existing = pm.list_all()
+        live_by_name = {lm.name: lm for lm in live_monitors if lm.enabled}
+        live_descs = {lm.description for lm in live_monitors if lm.enabled and lm.description}
+        has_target = False
+        has_matching_icc = not args.icc_native
+        has_foreign_monitor = False
+        for cand in existing:
+            for m in cand.monitors:
+                if not m.enabled:
+                    continue
+                if m.name in live_by_name:
+                    live_desc = live_by_name[m.name].description
+                    if live_desc and m.description and m.description != live_desc:
+                        has_foreign_monitor = True
+                    elif m.name == target_name:
+                        has_target = True
+                elif m.description and m.description not in live_descs:
+                    has_foreign_monitor = True
+                if args.icc_native and m.name == target_name and m.icc_profile == args.icc_native:
+                    has_matching_icc = True
+        if not existing or has_foreign_monitor or not has_target or not has_matching_icc:
+            return _sync_profiles(ipc, pm, settings, live_monitors, target_name, args)
+        print(f"Profils Monique déjà à jour ({len(existing)} profils)")
+        return 0
 
-    use_description = not settings.get("use_port_names", True)
+    from pathlib import Path
+    from monique.utils import hyprland_config_dir, save_active_profile, save_pinned_profile
+
+    use_description = not settings.get("use_port_names", False)
     hypr_fmt = settings.get("hypr_config_format")
+    if hypr_fmt == "legacy" and (hyprland_config_dir() / "hyprland.lua").exists():
+        hypr_fmt = "both"
     active_name = settings.get("active_profile") or ""
 
-    # If a dedicated Monique profile already matches the requested mode/ICC, select it
-    # instead of mutating an unrelated profile (like overwriting HDR Reference with sRGB).
+    live_by_name = {m.name: m for m in live_monitors}
+    target_live = live_by_name.get(target_name)
+    target_desc = target_live.description if target_live else ""
+
+    def _profile_matches_live(prof) -> bool:
+        has_target_mon = False
+        for m in prof.monitors:
+            if not m.enabled:
+                continue
+            lm = live_by_name.get(m.name)
+            if lm is None:
+                return False
+            if lm.description and m.description and m.description != lm.description:
+                return False
+            if m.name == target_name:
+                has_target_mon = True
+        return has_target_mon
+
+    def _sync_live_geometry(prof) -> None:
+        for m in prof.monitors:
+            lm = live_by_name.get(m.name)
+            if lm is not None:
+                m.description = lm.description
+                m.width = lm.width
+                m.height = lm.height
+                m.refresh_rate = lm.refresh_rate
+                m.x = lm.x
+                m.y = lm.y
+                m.scale = lm.scale
+                m.transform = lm.transform
+                m.enabled = lm.enabled
+
+    # If a dedicated Monique profile already matches the requested mode/ICC AND live monitor(s), select it.
     matched_profile = None
     for cand in pm.list_all():
+        if not _profile_matches_live(cand):
+            continue
         for m in cand.monitors:
             if m.name != target_name:
+                continue
+            if target_desc and m.description and m.description != target_desc:
                 continue
             if args.cm == "icc" or args.icc:
                 if args.icc and m.icc_profile == args.icc:
@@ -384,6 +454,7 @@ def main() -> int:
             break
 
     if matched_profile is not None:
+        _sync_live_geometry(matched_profile)
         matched_profile.last_applied_time = time.time()
         pm.save(matched_profile)
         save_active_profile(matched_profile.name)
@@ -398,23 +469,14 @@ def main() -> int:
         return 0
 
     profile = pm.load(active_name) if active_name else None
-    if profile is None or not profile.monitors:
-        profile = Profile(name=active_name or "testhdr", monitors=live_monitors)
+    if profile is None or not profile.monitors or not _profile_matches_live(profile):
+        profile = Profile(name=active_name or "testhdr", monitors=copy.deepcopy(live_monitors))
 
-    live_by_name = {m.name: m for m in live_monitors}
     target_found = False
     for m in profile.monitors:
         if m.name == target_name:
             target_found = True
-            lm = live_by_name.get(m.name)
-            if lm is not None:
-                m.width = lm.width
-                m.height = lm.height
-                m.refresh_rate = lm.refresh_rate
-                m.x = lm.x
-                m.y = lm.y
-                m.scale = lm.scale
-                m.transform = lm.transform
+            _sync_live_geometry(profile)
             _apply_cm_to_monitor(m, args)
             break
 

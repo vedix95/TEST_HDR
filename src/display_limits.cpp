@@ -693,12 +693,13 @@ bool apply_system_cm_monique(const std::string& cm_preset,
     return true;
 }
 
-bool sync_monique_profiles(const std::string& monitor_name,
-                           const std::string& monitor_description,
-                           const std::string& active_cm,
-                           const std::string& active_icc,
-                           const EdidHdrSpecs& edid,
-                           std::string& out_status) {
+static bool sync_monique_profiles_impl(const std::string& monitor_name,
+                                       const std::string& monitor_description,
+                                       const std::string& active_cm,
+                                       const std::string& active_icc,
+                                       const EdidHdrSpecs& edid,
+                                       bool only_if_needed,
+                                       std::string& out_status) {
     if (!ensure_startup_symlinks(edid, monitor_name, monitor_description)) {
         out_status = "Échec lors de la génération des profils ICC / liens symboliques";
         return false;
@@ -709,7 +710,7 @@ bool sync_monique_profiles(const std::string& monitor_name,
         return false;
     }
 
-    std::vector<std::string> args = {"--sync-profiles"};
+    std::vector<std::string> args = {only_if_needed ? "--sync-if-needed" : "--sync-profiles"};
     if (edid.hdr_capable) args.push_back("--hdr-capable");
     if (edid.supports_p3 || edid.hdr_capable) args.push_back("--supports-p3");
     if (!active_cm.empty()) {
@@ -740,8 +741,29 @@ bool sync_monique_profiles(const std::string& monitor_name,
             : ("Échec synchro profils Monique (code=" + std::to_string(code) + ")");
         return false;
     }
-    out_status = "ICC + Profils Monique remplacés : " + (stdout_msg.empty() ? "OK" : stdout_msg);
+    out_status = (only_if_needed ? "Profils Monique : " : "ICC + Profils Monique remplacés : ") +
+                 (stdout_msg.empty() ? "OK" : stdout_msg);
     return true;
+}
+
+bool sync_monique_profiles(const std::string& monitor_name,
+                           const std::string& monitor_description,
+                           const std::string& active_cm,
+                           const std::string& active_icc,
+                           const EdidHdrSpecs& edid,
+                           std::string& out_status) {
+    return sync_monique_profiles_impl(
+        monitor_name, monitor_description, active_cm, active_icc, edid, false, out_status);
+}
+
+bool sync_monique_profiles_if_needed(const std::string& monitor_name,
+                                     const std::string& monitor_description,
+                                     const std::string& active_cm,
+                                     const std::string& active_icc,
+                                     const EdidHdrSpecs& edid,
+                                     std::string& out_status) {
+    return sync_monique_profiles_impl(
+        monitor_name, monitor_description, active_cm, active_icc, edid, true, out_status);
 }
 
 bool read_sysfs_backlight(int& out_percent) {

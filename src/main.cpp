@@ -150,11 +150,29 @@ struct App {
         std::string mon = !preferred_connector.empty()
             ? preferred_connector
             : (!state.mode_limits.hypr_monitor.empty() ? state.mode_limits.hypr_monitor : state.edid.connector);
-        apply_system_cm_monique(cm_preset, mon, state.edid, state.system_status_msg, icc_path);
-        SDL_Delay(150);
-        SDL_PumpEvents();
-        refresh_hdr_capabilities();
+        if (!apply_system_cm_monique(cm_preset, mon, state.edid, state.system_status_msg, icc_path)) {
+            overlay_dirty = true;
+            return;
+        }
+        bool want_hdr = (cm_preset == "hdr" || cm_preset == "hdredid") ||
+                        (!icc_path.empty() && icc_path.find("BT2020") != std::string::npos);
+        std::string expect_cm = (cm_preset == "srgb10") ? "srgb" : cm_preset;
+        for (int attempt = 0; attempt < 18; ++attempt) {
+            SDL_Delay(50);
+            SDL_PumpEvents();
+            refresh_hdr_capabilities();
+            bool preset_ok = (cm_preset == "icc" && !icc_path.empty())
+                ? (state.mode_limits.active_icc_path == icc_path)
+                : (state.mode_limits.hypr_cm_preset == expect_cm && state.mode_limits.active_icc_path.empty());
+            if (preset_ok && (want_hdr == is_system_hdr_preset())) {
+                break;
+            }
+        }
         apply_hdr_output_mode(target_swapchain);
+        if (!want_hdr && is_system_hdr_preset()) {
+            state.system_status_msg =
+                "Hyprland reste bloqué en HDR (vérifiez ~/.config/hypr/hdr.lua ou cm_auto_hdr)";
+        }
         overlay_dirty = true;
     }
 
@@ -181,6 +199,23 @@ struct App {
                     swapchain_comp_name(comp), SDL_GetError());
             chosen = HdrOutputMode::Sdr;
             SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_VSYNC);
+        }
+
+        // Prevent compositor cm_auto_hdr / RADV WSI from promoting Sdr10 (HDR_EXTENDED_LINEAR) into HDR mode.
+        if (chosen == HdrOutputMode::Sdr10 && !is_system_hdr_preset()) {
+            SDL_Delay(100);
+            SDL_PumpEvents();
+            refresh_hdr_capabilities();
+            if (state.window_hdr_enabled || is_system_hdr_preset()) {
+                chosen = HdrOutputMode::Sdr;
+                SDL_SetGPUSwapchainParameters(device, window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, pmode);
+                SDL_Delay(80);
+                SDL_PumpEvents();
+                refresh_hdr_capabilities();
+                if (state.system_status_msg.empty()) {
+                    state.system_status_msg = "Auto-HDR compositeur détecté : bascule sur SDR standard";
+                }
+            }
         }
 
         state.hdr_output_mode = chosen;
@@ -744,9 +779,15 @@ int main(int argc, char* argv[]) {
             std::fprintf(stderr, "[TEST_HDR] Impossible de synchroniser les profils : Monique non installé.\n");
             return 1;
         }
-        EdidHdrSpecs edid = probe_drm_edid(preferred_connector);
         DisplayLimitsMonitor tmp_lim;
-        tmp_lim.poll_hyprland(preferred_connector.empty() ? edid.connector : preferred_connector);
+        tmp_lim.poll_hyprland(preferred_connector);
+        ModeLimitInfo pre_info = tmp_lim.resolve(false, 1.0f, 1.0f, EdidHdrSpecs{});
+        std::string probe_conn = !preferred_connector.empty() ? preferred_connector : pre_info.hypr_monitor;
+        EdidHdrSpecs edid = probe_drm_edid(probe_conn);
+        if (!edid.found && !probe_conn.empty()) {
+            edid = probe_drm_edid("");
+        }
+        tmp_lim.poll_hyprland(!probe_conn.empty() ? probe_conn : edid.connector);
         ModeLimitInfo info = tmp_lim.resolve(edid.hdr_capable, 1.0f, 1.0f, edid);
         std::string mon = !preferred_connector.empty()
             ? preferred_connector
@@ -798,11 +839,31 @@ int main(int argc, char* argv[]) {
     App app;
     app.fullscreen = start_fullscreen;
     app.preferred_connector = preferred_connector;
-    app.state.edid = probe_drm_edid(preferred_connector);
-    app.limits.poll_hyprland(preferred_connector.empty() ? app.state.edid.connector : preferred_connector);
+    app.limits.poll_hyprland(preferred_connector);
     {
-        ModeLimitInfo pre = app.limits.resolve(false, 1.0f, 1.0f, app.state.edid);
-        ensure_startup_symlinks(app.state.edid, preferred_connector, pre.hypr_description);
+        ModeLimitInfo pre_hypr = app.limits.resolve(false, 1.0f, 1.0f, app.state.edid);
+        std::string probe_conn = !preferred_connector.empty() ? preferred_connector : pre_hypr.hypr_monitor;
+        app.state.edid = probe_drm_edid(probe_conn);
+        if (!app.state.edid.found && !probe_conn.empty()) {
+            app.state.edid = probe_drm_edid("");
+        }
+        if (!probe_conn.empty()) {
+            app.limits.poll_hyprland(probe_conn);
+            pre_hypr = app.limits.resolve(false, 1.0f, 1.0f, app.state.edid);
+        }
+        std::string startup_mon = !preferred_connector.empty()
+            ? preferred_connector
+            : (!pre_hypr.hypr_monitor.empty() ? pre_hypr.hypr_monitor : app.state.edid.connector);
+        ensure_startup_symlinks(app.state.edid, startup_mon, pre_hypr.hypr_description);
+        if (monique_ready) {
+            std::string sync_msg;
+            std::string active_icc = detect_active_hypr_icc(startup_mon);
+            std::string active_cm = !pre_hypr.hypr_cm_preset.empty()
+                ? pre_hypr.hypr_cm_preset
+                : (app.state.edid.hdr_capable ? "hdr" : "srgb");
+            sync_monique_profiles_if_needed(
+                startup_mon, pre_hypr.hypr_description, active_cm, active_icc, app.state.edid, sync_msg);
+        }
     }
 
     SDL_WindowFlags flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;

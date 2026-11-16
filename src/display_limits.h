@@ -97,6 +97,15 @@ bool sync_monique_profiles(const std::string& monitor_name,
                            const EdidHdrSpecs& edid,
                            std::string& out_status);
 
+// Syncs Monique profiles on startup only if existing profiles are missing or belong
+// to a different monitor (e.g. migrating configs to a new GPU/display).
+bool sync_monique_profiles_if_needed(const std::string& monitor_name,
+                                     const std::string& monitor_description,
+                                     const std::string& active_cm,
+                                     const std::string& active_icc,
+                                     const EdidHdrSpecs& edid,
+                                     std::string& out_status);
+
 // Detects Omarchy OS from /etc/os-release content or system markers.
 bool parse_os_release_is_omarchy(const std::string& os_release_text);
 bool is_omarchy_system();
